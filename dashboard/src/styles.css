@@ -1,0 +1,24 @@
+:root { color-scheme: dark; }
+body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #0f1115; color: #e6e8ee; }
+.app { max-width: 960px; margin: 0 auto; padding: 24px; }
+h1, h2, h3 { font-weight: 600; }
+.card { background: #171a21; border: 1px solid #232733; border-radius: 8px; padding: 16px; margin: 12px 0; }
+label { display: block; margin: 8px 0; font-size: 14px; }
+input, select { width: 100%; padding: 6px 8px; background: #0f1115; color: inherit; border: 1px solid #2a2f3a; border-radius: 6px; box-sizing: border-box; }
+button { background: #3b82f6; color: white; border: 0; border-radius: 6px; padding: 8px 12px; cursor: pointer; margin-right: 8px; }
+button.ghost { background: transparent; border: 1px solid #2a2f3a; color: #e6e8ee; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.checkbox { display: flex; gap: 8px; align-items: center; }
+.envRow { display: grid; grid-template-columns: 160px 1fr 1fr auto; gap: 8px; margin-bottom: 6px; }
+.error { color: #f87171; }
+.warn { color: #fbbf24; }
+.logs pre { max-height: 360px; overflow: auto; background: #0b0d12; border-radius: 6px; padding: 12px; font-size: 12px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #232733; font-size: 14px; }
+a { color: #60a5fa; }
+.envUploader { margin-bottom: 12px; }
+.envUploaderRow { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.envUploaderRow label.inline { display: inline-flex; gap: 6px; align-items: center; margin: 0; font-size: 14px; }
+.envUploaderRow label.inline select { width: auto; }
+.ok { color: #34d399; font-size: 13px; margin: 6px 0 0; }
