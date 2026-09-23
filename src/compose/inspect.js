@@ -7,6 +7,7 @@ import path from 'node:path';
  *   - hard-coded `container_name:` entries
  *   - which services have a `build:` block
  *   - each built service's build-context path (relative)
+ *   - which services declare host-published `ports:`
  *
  * Returns:
  *   {
@@ -14,9 +15,8 @@ import path from 'node:path';
  *     containerNames: Record<string,string>,
  *     builtServices: Set<string>,
  *     buildContexts: Record<string,string>,
+ *     servicesWithPorts: Set<string>,
  *   }
- *
- * Conservative: unusual files return empty results and let compose decide.
  */
 export function inspectComposeFile(repoRoot, fileName) {
   const file = path.join(repoRoot, fileName);
@@ -25,6 +25,7 @@ export function inspectComposeFile(repoRoot, fileName) {
     containerNames: {},
     builtServices: new Set(),
     buildContexts: {},
+    servicesWithPorts: new Set(),
   };
   if (!fs.existsSync(file)) return empty;
 
@@ -43,6 +44,7 @@ export function inspectComposeFile(repoRoot, fileName) {
   const containerNames = {};
   const builtServices = new Set();
   const buildContexts = {};
+  const servicesWithPorts = new Set();
 
   for (const raw of lines) {
     if (!raw.trim() || raw.trimStart().startsWith('#')) continue;
@@ -57,10 +59,8 @@ export function inspectComposeFile(repoRoot, fileName) {
       continue;
     }
 
-    // Any line at or below servicesIndent ends the block.
     if (indent <= servicesIndent && raw.trim() !== '') break;
 
-    // A service key is at servicesIndent + 2 and looks like `name:`.
     if (indent === servicesIndent + 2) {
       const m = line.match(/^\s*([A-Za-z0-9_.-]+):\s*$/);
       currentService = m ? m[1] : null;
@@ -71,13 +71,10 @@ export function inspectComposeFile(repoRoot, fileName) {
 
     if (!currentService) continue;
 
-    // Keys at serviceIndent + 4 or deeper.
     if (indent >= servicesIndent + 4) {
-      // container_name: <name> (with optional quotes and trailing comment)
       const cn = line.match(/^\s*container_name:\s*["']?([^"'\s#]+)["']?\s*(?:#.*)?$/);
       if (cn) containerNames[currentService] = cn[1];
 
-      // build: ./frontend   (string form)
       const bStr = line.match(/^\s*build:\s*(\.\/[^\s#]+|\.)\s*(?:#.*)?$/);
       if (bStr) {
         builtServices.add(currentService);
@@ -86,26 +83,28 @@ export function inspectComposeFile(repoRoot, fileName) {
         continue;
       }
 
-      // build:   (block form; context: is a child line)
       if (/^\s*build:\s*$/.test(line)) {
         builtServices.add(currentService);
         inBuildBlock = true;
         continue;
       }
 
-      // context: ./frontend  (child of build:)
       const ctx = line.match(/^\s*context:\s*(\.\/[^\s#]+|\.)\s*(?:#.*)?$/);
       if (ctx && inBuildBlock) {
         buildContexts[currentService] = ctx[1];
         continue;
       }
 
-      // Any other key ends the inline build: block.
+      // ports:  — either inline (`ports: ["5000:5000"]`) or block form (`ports:` on its own)
+      if (/^\s*ports:\s*/.test(line)) {
+        servicesWithPorts.add(currentService);
+      }
+
       if (inBuildBlock && indent <= servicesIndent + 4) {
         inBuildBlock = false;
       }
     }
   }
 
-  return { serviceNames, containerNames, builtServices, buildContexts };
+  return { serviceNames, containerNames, builtServices, buildContexts, servicesWithPorts };
 }

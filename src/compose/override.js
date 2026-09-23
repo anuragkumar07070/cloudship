@@ -4,30 +4,35 @@ import path from 'node:path';
 /**
  * Build an override compose file that:
  *   1. Neutralizes hard-coded container_name entries (preserving them as
- *      network aliases), AND
- *   2. Injects runtime env vars into every service via `environment:`.
- *
- * Build-time Vite vars are NOT passed as build args here. Instead,
- * stages.js writes a `.env.production` file into each frontend's build
- * context. This works without requiring ARG declarations in the repo's
- * own Dockerfile.
+ *      network aliases).
+ *   2. Clears any host-published `ports:` blocks so the deployment does
+ *      not fight other services on the host for ports, and so the proxy
+ *      can reach containers by name on the deployment network.
+ *   3. Injects runtime env vars via `environment:` for every service.
  *
  * Returns { overridePath, args } where `args` is the `-f ...` sequence.
  */
 export function writeComposeOverride(repoRoot, baseFileName, inspected, envVars = []) {
-  const { containerNames, serviceNames } = inspected;
+  const {
+    containerNames,
+    serviceNames,
+    servicesWithPorts,
+  } = inspected;
+
   const hasNames = containerNames && Object.keys(containerNames).length > 0;
+  const hasPorts = servicesWithPorts && servicesWithPorts.size > 0;
   const hasEnv = Array.isArray(envVars) && envVars.length > 0;
 
-  if (!hasNames && !hasEnv) {
+  if (!hasNames && !hasPorts && !hasEnv) {
     return { overridePath: null, args: ['-f', baseFileName] };
   }
 
-  const targetServices = hasNames
-    ? Object.keys(containerNames)
-    : (serviceNames || []);
+  const targetServices = new Set();
+  if (hasNames) for (const s of Object.keys(containerNames)) targetServices.add(s);
+  if (hasPorts) for (const s of servicesWithPorts) targetServices.add(s);
+  if (hasEnv) for (const s of (serviceNames || [])) targetServices.add(s);
 
-  if (targetServices.length === 0) {
+  if (targetServices.size === 0) {
     return { overridePath: null, args: ['-f', baseFileName] };
   }
 
@@ -36,6 +41,7 @@ export function writeComposeOverride(repoRoot, baseFileName, inspected, envVars 
   for (const service of targetServices) {
     lines.push(`  ${service}:`);
 
+    // --- container_name neutralization -----------------------------------
     if (hasNames && containerNames[service]) {
       lines.push(`    container_name: null`);
       lines.push(`    networks:`);
@@ -44,15 +50,23 @@ export function writeComposeOverride(repoRoot, baseFileName, inspected, envVars 
       lines.push(`          - ${containerNames[service]}`);
     }
 
+    // --- strip host-published ports --------------------------------------
+    // `!reset` is the correct directive for clearing a merged list value.
+    // Compose v2.20+ supports it. Older versions will fall back to `[]`,
+    // which may not override a base list cleanly — the runtime will warn.
+    if (hasPorts && servicesWithPorts.has(service)) {
+      lines.push(`    ports: !reset []`);
+    }
+
+    // --- runtime env -----------------------------------------------------
     if (hasEnv) {
       const applicable = envVars.filter(
         (r) => !r.serviceName || r.serviceName === service,
       );
-
       if (applicable.length > 0) {
         lines.push(`    environment:`);
         for (const row of applicable) {
-          if (!row.key) continue;
+          if (!row.key  || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(row.key)) continue;
           const val = String(row.value ?? '')
             .replace(/\\/g, '\\\\')
             .replace(/"/g, '\\"');

@@ -7,7 +7,11 @@ import { makeLogger } from '../logger.js';
 import { makeRedactor } from './redact.js';
 import { cloneRepo, workspacePath } from '../git/clone.js';
 import { scanForServiceRoots } from '../scanner/scan.js';
-import { classifyService } from '../classifier/classify.js';
+import {
+  classifyService,
+  isFrontendServiceName,
+  isBackendServiceName,
+} from '../classifier/classify.js';
 import { buildService } from '../builder/build.js';
 import {
   runService,
@@ -41,8 +45,6 @@ import { enqueue } from '../queue/queue.js';
 import { inspectComposeFile } from '../compose/inspect.js';
 import { writeComposeOverride } from '../compose/override.js';
 
-// Docker image repository names cannot contain `_`. Restrict the id to
-// [a-z0-9] so image tags stay valid.
 const dockerSafeId = customAlphabet('abcdefghijklmnopqrstuvwxyz0123456789', 8);
 
 export function newDeploymentId() {
@@ -50,7 +52,191 @@ export function newDeploymentId() {
 }
 
 /* ------------------------------------------------------------------ *
- *  Stages 1–4  —  clone, compose short-circuit, scan, classify
+ *  Stop / Start (container lifecycle, no teardown)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Stop every container in this deployment without removing it, remove the
+ * deployment's proxy routes so its URLs stop resolving, and mark the
+ * deployment `stopped`.
+ */
+export async function stopDeployment(deploymentId, { log } = {}) {
+  const deployment = getDeployment(deploymentId);
+  if (!deployment) throw new Error(`Unknown deployment ${deploymentId}`);
+
+  const logger = log || makeLogger(deploymentId);
+  logger(`Stopping deployment ${deploymentId}`);
+
+  const dockerRun = (args) =>
+    new Promise((resolve) => {
+      const child = spawn('docker', args);
+      child.on('error', () => resolve(false));
+      child.on('close', (code) => resolve(code === 0));
+    });
+
+  setStatus(deploymentId, 'stopping');
+
+  for (const svc of deployment.services || []) {
+    if (!svc.containerId) continue;
+    logger(`Stopping container for ${svc.name}`);
+    const ok = await dockerRun(['stop', svc.containerId]);
+    if (!ok) logger(`Failed to stop container ${svc.containerId}`, 'err');
+  }
+
+  // Remove proxy routes so URLs stop resolving while stopped.
+  try { await removeRoutes(deploymentId); }
+  catch (e) { logger(`Could not remove proxy routes: ${e.message}`, 'err'); }
+
+  setStatus(deploymentId, 'stopped');
+  logger(`Deployment stopped.`);
+  return getDeployment(deploymentId);
+}
+
+/**
+ * Start every container that already exists for this deployment, re-run
+ * health checks, and re-publish the proxy routes.
+ */
+export async function startDeployment(deploymentId, { log } = {}) {
+  const deployment = getDeployment(deploymentId);
+  if (!deployment) throw new Error(`Unknown deployment ${deploymentId}`);
+
+  const logger = log || makeLogger(deploymentId);
+  logger(`Starting deployment ${deploymentId}`);
+
+  const dockerRun = (args) =>
+    new Promise((resolve) => {
+      const child = spawn('docker', args);
+      let out = '';
+      child.stdout.on('data', (d) => { out += d.toString(); });
+      child.stderr.on('data', (d) => { out += d.toString(); });
+      child.on('error', () => resolve({ ok: false, out }));
+      child.on('close', (code) => resolve({ ok: code === 0, out }));
+    });
+
+  setStatus(deploymentId, 'starting');
+
+  // Start containers.
+  for (const svc of deployment.services || []) {
+    if (!svc.containerId) continue;
+    logger(`Starting container for ${svc.name}`);
+    const { ok, out } = await dockerRun(['start', svc.containerId]);
+    if (!ok) {
+      logger(`Failed to start ${svc.containerId}: ${out.trim()}`, 'err');
+      setStatus(deploymentId, 'failed', `Failed to start container for ${svc.name}`);
+      throw new Error(`Failed to start container for ${svc.name}`);
+    }
+  }
+
+  // Determine the network to health-check on. Compose deployments use
+  // <project>_default; non-compose deployments use cloudship-<id>-net.
+  const composeNetwork = deployment.composePath
+    ? await findComposeNetwork(`cloudship-${deploymentId}`)
+    : null;
+  const network = composeNetwork || `cloudship-${deploymentId}-net`;
+
+  // Health-check + collect routing info.
+  setStatus(deploymentId, 'health-check');
+
+  const { db } = await import('../state/db.js');
+  const routable = [];
+
+    const ws = workspacePath(deploymentId);
+  for (const svc of deployment.services || []) {
+    if (!svc.port) {
+      continue;
+    }
+    const containerName = `cloudship-${deploymentId}-${svc.name}`;
+    const candidates = deployment.composePath
+      ? [`cloudship-${deploymentId}-${svc.name}-1`, svc.name, containerName]
+      : [containerName];
+
+    // Best-effort Dockerfile lookup. For non-compose services the
+    // Dockerfile lives at <workspace>/<rootPath>/Dockerfile. For compose
+    // services we don't have the inspector here, so we try the service's
+    // own rootPath — which will be '.' for most compose projects and
+    // therefore point at the workspace root. If the file doesn't exist,
+    // isNodeBasedService() returns false and the shell probe is used,
+    // which is the previous behavior anyway.
+    const dockerfilePath = path.join(ws, svc.rootPath || '.', 'Dockerfile');
+
+    let ok = false;
+    let usedName = containerName;
+    for (const name of candidates) {
+      ok = await healthCheck({
+        containerName: name,
+        port: svc.port,
+        network,
+        log: logger,
+        service: { ...svc, __dockerfilePath: dockerfilePath },
+      });
+      if (ok) { usedName = name; break; }
+    }
+    if (!ok) {
+      logger(`Health check failed for ${svc.name} on port ${svc.port}`, 'err');
+      await captureContainerLogs(containerName, logger);
+      setStatus(deploymentId, 'failed', `Health check failed for ${svc.name}`);
+      throw new Error(`Health check failed for ${svc.name}`);
+    }
+    db.prepare(`UPDATE services SET containerStatus='healthy' WHERE deploymentId=? AND name=?`)
+      .run(deploymentId, svc.name);
+    routable.push({ svc, usedName });
+  }
+
+  // Re-publish proxy routes.
+  try {
+    await ensureProxy();
+    await connectProxyToNetwork(network);
+
+    const names = (deployment.services || []).map((s) => s.name);
+    const frontendName = names.find((n) => isFrontendServiceName(n));
+    const backendName = names.find((n) => isBackendServiceName(n));
+    const canCombine =
+      names.length === 2 && frontendName && backendName &&
+      routable.some((r) => r.svc.name === frontendName) &&
+      routable.some((r) => r.svc.name === backendName);
+
+    const urls = [];
+
+    if (canCombine) {
+      const f = routable.find((r) => r.svc.name === frontendName);
+      const b = routable.find((r) => r.svc.name === backendName);
+      await writeCombinedRoute({
+        deploymentId,
+        frontend: { name: f.usedName, port: f.svc.port },
+        backend: { name: b.usedName, port: b.svc.port },
+      });
+      urls.push(`${config.scheme}://${deploymentId}.${config.baseDomain}`);
+    } else {
+      for (const { svc, usedName } of routable) {
+        await writeRoute({
+          deploymentId,
+          service: { name: svc.name, isPublic: true, alsoBare: routable.length === 1 },
+          upstreamHost: usedName,
+          upstreamPort: svc.port,
+        });
+        urls.push(`${config.scheme}://${deploymentId}-${svc.name}.${config.baseDomain}`);
+      }
+      if (routable.length === 1) {
+        urls.push(`${config.scheme}://${deploymentId}.${config.baseDomain}`);
+      }
+    }
+
+    await reloadProxy();
+    setUrls(deploymentId, urls);
+    logger(`Published URLs: ${urls.join(', ') || '(none)'}`);
+  } catch (e) {
+    logger(`Could not re-publish proxy routes: ${e.message}`, 'err');
+    setStatus(deploymentId, 'failed', `Could not re-publish proxy routes: ${e.message}`);
+    throw e;
+  }
+
+  setStatus(deploymentId, 'running');
+  logger(`Deployment is running.`);
+  return getDeployment(deploymentId);
+}
+
+/* ------------------------------------------------------------------ *
+ *  Stages 1–4
  * ------------------------------------------------------------------ */
 
 export async function detect(deploymentId, repoUrl, branch) {
@@ -61,7 +247,7 @@ export async function detect(deploymentId, repoUrl, branch) {
 
     const composeFile =
       fs.existsSync(path.join(repoRoot, 'docker-compose.yml')) ? 'docker-compose.yml' :
-      fs.existsSync(path.join(repoRoot, 'compose.yml')) ? 'compose.yml' : null;
+        fs.existsSync(path.join(repoRoot, 'compose.yml')) ? 'compose.yml' : null;
 
     if (composeFile) {
       log(`Compose file detected: ${composeFile}. Skipping stages 3-6.`);
@@ -91,7 +277,7 @@ export async function detect(deploymentId, repoUrl, branch) {
 }
 
 /* ------------------------------------------------------------------ *
- *  Stages 5–7  —  confirm, build, run & expose (non-compose path)
+ *  Stages 5–7  —  non-compose path
  * ------------------------------------------------------------------ */
 
 export async function deploy(deploymentId, confirmed) {
@@ -119,13 +305,12 @@ export async function deploy(deploymentId, confirmed) {
         return await deployCompose(deploymentId, workspace, envRows, log);
       }
 
-      // --- Non-compose path ------------------------------------------------
       const publicServices = confirmed.services.filter((s) => s.isPublic);
       const urls = [];
       for (const s of publicServices) {
         s.alsoBare = publicServices.length === 1;
-        urls.push(`https://${deploymentId}-${s.name}.${config.baseDomain}`);
-        if (s.alsoBare) urls.push(`https://${deploymentId}.${config.baseDomain}`);
+        urls.push(`${config.scheme}://${deploymentId}-${s.name}.${config.baseDomain}`);
+        if (s.alsoBare) urls.push(`${config.scheme}://${deploymentId}.${config.baseDomain}`);
       }
       setUrls(deploymentId, urls);
 
@@ -135,11 +320,11 @@ export async function deploy(deploymentId, confirmed) {
 
       const backendUrlForFrontend =
         wireCross && nodeSvc.isPublic
-          ? `https://${deploymentId}-${nodeSvc.name}.${config.baseDomain}`
+          ? `${config.scheme}://${deploymentId}-${nodeSvc.name}.${config.baseDomain}`
           : null;
       const frontendUrlForBackend =
         wireCross && staticSvc.isPublic
-          ? `https://${deploymentId}-${staticSvc.name}.${config.baseDomain}`
+          ? `${config.scheme}://${deploymentId}-${staticSvc.name}.${config.baseDomain}`
           : null;
 
       setStatus(deploymentId, 'building');
@@ -218,6 +403,10 @@ export async function deploy(deploymentId, confirmed) {
           port: svc.port,
           network,
           log,
+          service: {
+            ...svc,
+            __dockerfilePath: path.join(workspace, svc.rootPath, 'Dockerfile'),
+          },
         });
         if (!ok) {
           log(`Health check timed out for ${svc.name}`, 'err');
@@ -232,6 +421,7 @@ export async function deploy(deploymentId, confirmed) {
         });
       }
 
+      // Proxy rules for public services
       for (const svc of publicServices) {
         await writeRoute({
           deploymentId,
@@ -240,6 +430,7 @@ export async function deploy(deploymentId, confirmed) {
           upstreamPort: svc.port,
         });
       }
+
       await reloadProxy();
 
       setStatus(deploymentId, 'running');
@@ -257,22 +448,15 @@ export async function deploy(deploymentId, confirmed) {
 }
 
 /* ------------------------------------------------------------------ *
- *  Compose path  —  Stage 2 continuation
+ *  Compose path
  * ------------------------------------------------------------------ */
 
-/**
- * Deploy via the repo's own docker-compose.yml.
- *
- * Vite env vars are delivered by writing `.env.production` into each
- * frontend's build context (Vite reads it automatically during build).
- * No ARG declarations in the repo's Dockerfile are required.
- */
 async function deployCompose(deploymentId, workspace, envRows, log) {
   const project = `cloudship-${deploymentId}`;
 
   const composeFile =
     fs.existsSync(path.join(workspace, 'docker-compose.yml')) ? 'docker-compose.yml' :
-    fs.existsSync(path.join(workspace, 'compose.yml')) ? 'compose.yml' : null;
+      fs.existsSync(path.join(workspace, 'compose.yml')) ? 'compose.yml' : null;
   if (!composeFile) throw new Error('No compose file found at repo root');
 
   const run = (args, { allowFail = false, envOverride = null } = {}) =>
@@ -289,11 +473,9 @@ async function deployCompose(deploymentId, workspace, envRows, log) {
       });
     });
 
-  // --- pre-flight cleanup --------------------------------------------------
   log(`Pre-flight: cleaning any prior project state for ${project}`);
   await run(['compose', '-p', project, 'down', '--remove-orphans'], { allowFail: true });
 
-  // --- inspect compose -----------------------------------------------------
   const inspected = inspectComposeFile(workspace, composeFile);
   const hardCoded = inspected.containerNames || {};
   const reclaimNames = Object.values(hardCoded).filter(Boolean);
@@ -304,35 +486,34 @@ async function deployCompose(deploymentId, workspace, envRows, log) {
     }
   }
 
-  // --- decide routing mode up front (affects baked API URL) ---------------
+  // --- decide routing mode up front (affects baked API URL) --------------
   const names = inspected.serviceNames || [];
-  const frontendName = names.find((n) => /frontend|web|client/i.test(n));
-  const backendName  = names.find((n) => /backend|api|server/i.test(n));
+  const frontendName = names.find((n) => isFrontendServiceName(n));
+  const backendName = names.find((n) => isBackendServiceName(n));
   const willUseCombined = names.length === 2 && !!frontendName && !!backendName;
 
   if (willUseCombined) {
     log(`Detected frontend+backend pair (${frontendName} + ${backendName}); using same-origin routing.`);
   }
 
-  // --- rewrite env vars so they point at deployed URLs -------------------
-  const publicBackendUrl  = willUseCombined
-    ? `http://${deploymentId}.${config.baseDomain}`
-    : (backendName  ? `http://${deploymentId}-${backendName}.${config.baseDomain}`  : null);
+  const publicBackendUrl = willUseCombined
+    ? `${config.scheme}://${deploymentId}.${config.baseDomain}`
+    : (backendName ? `${config.scheme}://${deploymentId}-${backendName}.${config.baseDomain}` : null);
   const publicFrontendUrl = willUseCombined
-    ? `http://${deploymentId}.${config.baseDomain}`
-    : (frontendName ? `http://${deploymentId}-${frontendName}.${config.baseDomain}` : null);
+    ? `${config.scheme}://${deploymentId}.${config.baseDomain}`
+    : (frontendName ? `${config.scheme}://${deploymentId}-${frontendName}.${config.baseDomain}` : null);
 
   const rewrittenEnvRows = envRows.map((r) => {
     if (!r || !r.key) return r;
     const val = typeof r.value === 'string' ? r.value : '';
 
-    if (r.key === 'VITE_API_URL') {
+    if (r.key === 'VITE_API_URL' || r.key === 'REACT_APP_API_URL') {
       return { ...r, value: willUseCombined ? '/api' : (publicBackendUrl ? `${publicBackendUrl}/api` : r.value) };
     }
-    if (r.key === 'VITE_SOCKET_URL') {
+    if (r.key === 'VITE_SOCKET_URL' || r.key === 'REACT_APP_SOCKET_URL') {
       return { ...r, value: willUseCombined ? '/' : (publicBackendUrl || r.value) };
     }
-    if (r.key === 'VITE_BACKEND_URL') {
+    if (r.key === 'VITE_BACKEND_URL' || r.key === 'REACT_APP_BACKEND_URL') {
       return { ...r, value: willUseCombined ? '' : (publicBackendUrl || r.value) };
     }
     if (r.key === 'FRONTEND_URL' || r.key === 'CLIENT_URL' || r.key === 'CORS_ORIGIN') {
@@ -349,7 +530,6 @@ async function deployCompose(deploymentId, workspace, envRows, log) {
     return r;
   });
 
-  // --- write workspace .env for `${VAR}` substitution --------------------
   const globalEnv = rewrittenEnvRows.filter((r) => r && r.key && !r.serviceName);
   if (globalEnv.length > 0) {
     fs.writeFileSync(
@@ -358,18 +538,15 @@ async function deployCompose(deploymentId, workspace, envRows, log) {
     );
   }
 
-  // --- write .env.production into each frontend build context ------------
-  // This is what makes Vite pick up build-time vars with NO repo changes.
+  // Write build-time env files into frontend build contexts.
   for (const serviceName of names) {
-    if (!/frontend|web|client|app|ui/i.test(serviceName)) continue;
+    if (!isFrontendServiceName(serviceName)) continue;
     writeFrontendEnvFiles(workspace, inspected, serviceName, rewrittenEnvRows, log);
   }
 
-  // --- write override file (container_name neutralization + runtime env) --
   const { args: composeArgs } = writeComposeOverride(workspace, composeFile, inspected, rewrittenEnvRows);
   log(`Using compose invocation: docker compose -p ${project} ${composeArgs.join(' ')} up -d --build`);
 
-  // --- build & bring up ---------------------------------------------------
   setStatus(deploymentId, 'building');
   const composeEnv = {};
   for (const r of rewrittenEnvRows) composeEnv[r.key] = r.value;
@@ -378,13 +555,15 @@ async function deployCompose(deploymentId, workspace, envRows, log) {
     { envOverride: composeEnv },
   );
 
-  // --- determine compose network -----------------------------------------
   const composeNetwork = await findComposeNetwork(project);
-  if (!composeNetwork) {
-    log('Could not determine compose network; health checks and proxy routing may fail.', 'err');
+
+  // --- attach proxy to the compose network (once) -------------------------
+  await ensureProxy();
+  if (composeNetwork) {
+    log(`Attaching proxy to compose network ${composeNetwork}`);
+    await connectProxyToNetwork(composeNetwork);
   }
 
-  // --- enumerate containers ----------------------------------------------
   const { out: psOut } = await run([
     'compose', '-p', project, ...composeArgs, 'ps', '--format', 'json',
   ]);
@@ -415,7 +594,6 @@ async function deployCompose(deploymentId, workspace, envRows, log) {
   });
   tx();
 
-  // --- health-check each compose container (NON-FATAL) -------------------
   setStatus(deploymentId, 'health-check');
   for (const c of containers) {
     const internalPort = extractInternalPort(c);
@@ -424,11 +602,22 @@ async function deployCompose(deploymentId, workspace, envRows, log) {
       continue;
     }
     const containerName = c.Name || c.Service;
+    // Look up the service's build context from the inspector so we can
+    // point __dockerfilePath at the actual Dockerfile, if there is one.
+    const ctxRel = inspected.buildContexts?.[c.Service];
+    const dockerfilePath = ctxRel
+      ? path.join(workspace, ctxRel, 'Dockerfile')
+      : null;
     const ok = await healthCheck({
       containerName,
       port: internalPort,
       network: composeNetwork,
       log,
+      service: {
+        name: c.Service,
+        type: 'compose',
+        __dockerfilePath: dockerfilePath,
+      },
     });
     if (!ok) {
       log(`Health check did not pass for ${c.Service}; continuing anyway.`, 'err');
@@ -441,14 +630,6 @@ async function deployCompose(deploymentId, workspace, envRows, log) {
       .run(deploymentId, c.Service);
   }
 
-  // --- attach proxy ------------------------------------------------------
-  await ensureProxy();
-  if (composeNetwork) {
-    log(`Attaching proxy to compose network ${composeNetwork}`);
-    await connectProxyToNetwork(composeNetwork);
-  }
-
-  // --- publish URLs and write proxy routes -------------------------------
   const urls = [];
   const routable = [];
   for (const c of containers) {
@@ -470,10 +651,10 @@ async function deployCompose(deploymentId, workspace, envRows, log) {
     await writeCombinedRoute({
       deploymentId,
       frontend: { name: f.container.Name || f.container.Service, port: f.port },
-      backend:  { name: b.container.Name || b.container.Service, port: b.port  },
+      backend: { name: b.container.Name || b.container.Service, port: b.port },
     });
-    urls.push(`https://${deploymentId}.${config.baseDomain}`);
-    log(`Using combined same-origin route at https://${deploymentId}.${config.baseDomain}`);
+    urls.push(`${config.scheme}://${deploymentId}.${config.baseDomain}`);
+    log(`Using combined same-origin route at ${config.scheme}://${deploymentId}.${config.baseDomain}`);
   } else {
     for (const { container: c, port } of routable) {
       const upstreamHost = c.Name || c.Service;
@@ -487,10 +668,10 @@ async function deployCompose(deploymentId, workspace, envRows, log) {
         upstreamHost,
         upstreamPort: port,
       });
-      urls.push(`https://${deploymentId}-${c.Service}.${config.baseDomain}`);
+      urls.push(`${config.scheme}://${deploymentId}-${c.Service}.${config.baseDomain}`);
     }
     if (routable.length === 1) {
-      urls.push(`https://${deploymentId}.${config.baseDomain}`);
+      urls.push(`${config.scheme}://${deploymentId}.${config.baseDomain}`);
     }
   }
 
@@ -498,8 +679,8 @@ async function deployCompose(deploymentId, workspace, envRows, log) {
   setUrls(deploymentId, urls);
   log(`Published URLs: ${urls.join(', ') || '(none)'}`);
   log(
-    'Note: proxy currently serves plain HTTP on port 80. For local access, ' +
-    `add "/etc/hosts" entries for the hostnames above and use http:// instead of https://.`,
+    `Note: proxy currently serves plain HTTP on port 80. For local access, ` +
+    `add "/etc/hosts" entries for the hostnames above and use ${config.scheme}:// instead of https://.`,
   );
 
   setStatus(deploymentId, 'running');
@@ -507,20 +688,67 @@ async function deployCompose(deploymentId, workspace, envRows, log) {
   return getDeployment(deploymentId);
 }
 
+/* ------------------------------------------------------------------ *
+ *  Frontend build-time env files
+ * ------------------------------------------------------------------ */
+
 /**
- * Write a `.env.production` (and backups) into the frontend's build
- * context. Vite reads these files automatically at build time — no
- * Dockerfile ARG declarations required.
+ * Detect the frontend framework of a service by reading its package.json.
+ * Returns 'vite' | 'cra' | 'unknown'.
+ */
+function detectFrontendFramework(ctxAbs) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(ctxAbs, 'package.json'), 'utf8'));
+    const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+    if (deps['vite']) return 'vite';
+    if (deps['react-scripts']) return 'cra';
+    return 'unknown';
+  } catch { return 'unknown'; }
+}
+
+/**
+ * Read a .dockerignore and determine whether any of the given filenames
+ * would be excluded. Returns the matching pattern, or null.
+ */
+function dockerignoreExcludes(ctxAbs, filenames) {
+  const ignorePath = path.join(ctxAbs, '.dockerignore');
+  if (!fs.existsSync(ignorePath)) return null;
+
+  let lines;
+  try { lines = fs.readFileSync(ignorePath, 'utf8').split(/\r?\n/); }
+  catch { return null; }
+
+  const patterns = lines
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#'));
+
+  for (const pattern of patterns) {
+    const rx = new RegExp(
+      '^' +
+      pattern
+        .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+        .replace(/\*/g, '.*')
+        .replace(/\?/g, '.') +
+      '$'
+    );
+    for (const name of filenames) {
+      if (rx.test(name) || rx.test(`./${name}`)) return pattern;
+    }
+  }
+  return null;
+}
+
+/**
+ * Write .env.production / .env.local / .env into a frontend's build context.
+ * Works for Vite (VITE_*) and CRA (REACT_APP_*) — the framework is detected
+ * from the build context's package.json.
  *
- * We write all three names to maximize compatibility across Vite modes:
- *   .env.production  used by `vite build` in production
- *   .env.local       used by `vite dev`
- *   .env             fallback if the others are ignored
+ * Warns (does not modify) if the service's .dockerignore excludes .env files.
  */
 function writeFrontendEnvFiles(workspace, inspected, service, envRows, log) {
   const ctxRel = inspected.buildContexts?.[service];
   if (!ctxRel) {
-    log(`No build context found for ${service}; skipping Vite env write`, 'warn');
+    log(`No build context found for ${service}; skipping frontend env write`, 'warn');
     return;
   }
   const ctxAbs = path.resolve(workspace, ctxRel);
@@ -529,20 +757,35 @@ function writeFrontendEnvFiles(workspace, inspected, service, envRows, log) {
     return;
   }
 
-  const viteRows = envRows.filter(
-    (r) => r && r.key && /^VITE_/.test(r.key) && (!r.serviceName || r.serviceName === service),
-  );
-  if (viteRows.length === 0) return;
+  const framework = detectFrontendFramework(ctxAbs);
+  const prefix = framework === 'cra' ? /^REACT_APP_/ : /^VITE_/;
 
-  const contents = viteRows.map((r) => `${r.key}=${r.value}`).join('\n') + '\n';
-  for (const name of ['.env.production', '.env.local', '.env']) {
+  const rows = envRows.filter(
+    (r) => r && r.key && prefix.test(r.key) && (!r.serviceName || r.serviceName === service),
+  );
+  if (rows.length === 0) {
+    return;
+  }
+
+  const filenames = ['.env.production', '.env.local', '.env'];
+  const excluded = dockerignoreExcludes(ctxAbs, filenames);
+  if (excluded) {
+    log(
+      `This repo's .dockerignore (pattern "${excluded}") excludes .env files; ` +
+      `build-time variables will not reach the image.`,
+      'err',
+    );
+  }
+
+  const contents = rows.map((r) => `${r.key}=${r.value}`).join('\n') + '\n';
+  for (const name of filenames) {
     try {
       fs.writeFileSync(path.join(ctxAbs, name), contents);
     } catch (e) {
       log(`Could not write ${name} into ${ctxRel}: ${e.message}`, 'err');
     }
   }
-  log(`Wrote ${viteRows.length} Vite var(s) into ${ctxRel}/.env.production`);
+  log(`Wrote ${rows.length} ${framework === 'cra' ? 'CRA' : 'Vite'} var(s) into ${ctxRel}/.env.production`);
 }
 
 /* ------------------------------------------------------------------ *
@@ -597,7 +840,7 @@ function dockerJson(args) {
     const child = spawn('docker', args);
     let out = '';
     child.stdout.on('data', (d) => (out += d.toString()));
-    child.stderr.on('data', () => {});
+    child.stderr.on('data', () => { });
     child.on('error', () => resolve(null));
     child.on('close', (code) => {
       if (code !== 0) return resolve(null);

@@ -5,6 +5,27 @@ const BUNDLERS = ['vite', 'react-scripts'];
 const UI_FRAMEWORKS = ['react', 'react-dom', 'vue'];
 const SERVER_FRAMEWORKS = ['express', 'fastify', 'koa', '@nestjs/core'];
 
+/**
+ * Single source of truth for "does this service name look like a frontend?"
+ * Used by:
+ *   - deployCompose() to decide same-origin routing (willUseCombined)
+ *   - writeFrontendEnvFiles() to decide where to write .env.production
+ * Keeping this in one place ensures both decisions always agree.
+ */
+export function isFrontendServiceName(name) {
+  if (typeof name !== 'string') return false;
+  return /frontend|web|client|app|ui/i.test(name);
+}
+
+/**
+ * Single source of truth for "does this service name look like a backend?"
+ * Used by deployCompose() to identify the pairing counterpart.
+ */
+export function isBackendServiceName(name) {
+  if (typeof name !== 'string') return false;
+  return /backend|api|server/i.test(name);
+}
+
 function readJson(p) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
 }
@@ -51,12 +72,11 @@ export function classifyService(repoRoot, relPath) {
   } else if (type === 'node-server') {
     service.startCommand = pkg.scripts?.start || '';
     const exposed = dockerfileText ? detectExpose(dockerfileText) : null;
-    service.port = exposed ?? null; // blank -> user must fill
+    service.port = exposed ?? null;
   } else if (type === 'dockerfile-provided') {
     service.port = detectExpose(dockerfileText) ?? null;
   }
 
-  // Incompatibility warnings
   const vercelPath = path.join(repoRoot, 'vercel.json');
   if (fs.existsSync(vercelPath)) {
     let vercel = null;

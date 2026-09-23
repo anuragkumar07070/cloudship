@@ -11,7 +11,6 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use('/api', router);
 
-// serve the built dashboard if it exists
 const dashboardDist = path.resolve(__dirname, '..', 'dashboard', 'dist');
 if (fs.existsSync(dashboardDist)) {
   app.use(express.static(dashboardDist));
@@ -20,6 +19,10 @@ if (fs.existsSync(dashboardDist)) {
 
 app.listen(config.port, async () => {
   console.log(`CloudShip backend listening on :${config.port}`);
-  try { await ensureProxy(); }
-  catch (e) { console.warn(`Proxy not started (ok in dev): ${e.message}`); }
+  try {
+    await ensureProxy();
+    console.log('[proxy] ready');
+  } catch (e) {
+    console.warn(`[proxy] startup check failed: ${e.message}`);
+  }
 });

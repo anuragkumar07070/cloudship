@@ -1,11 +1,12 @@
 import express from 'express';
 import { nanoid } from 'nanoid';
-import { detect, deploy, teardown, newDeploymentId } from '../pipeline/stages.js';
+import { detect, deploy, teardown, newDeploymentId ,stopDeployment, startDeployment  } from '../pipeline/stages.js';
 import {
   createDeployment, getDeployment, listDeployments, deleteDeployment, setStatus,
 } from '../state/deployments.js';
-import {parseEnvFile, envKeysOnly} from '../env/parseENV.js';
+import { parseEnvFile, envKeysOnly } from '../env/parseENV.js';
 import { subscribe, readLogHistory } from '../logger.js';
+import { config } from '../config.js';
 import multer from 'multer';
 
 const upload = multer({
@@ -67,6 +68,37 @@ router.post('/deployments/:id/confirm', async (req, res) => {
   res.status(202).json({ ok: true, deploymentId: req.params.id });
 });
 
+router.post('/deployments/:id/stop', async (req, res) => {
+  const d = getDeployment(req.params.id);
+  if (!d) return res.status(404).json({ error: 'not found' });
+
+  // Async, same pattern as confirm.
+  stopDeployment(req.params.id).catch(() => { /* status already set */ });
+  res.status(202).json({ ok: true, deploymentId: req.params.id });
+});
+
+router.post('/deployments/:id/start', async (req, res) => {
+  const d = getDeployment(req.params.id);
+  if (!d) return res.status(404).json({ error: 'not found' });
+
+  startDeployment(req.params.id).catch(() => { /* status already set */ });
+  res.status(202).json({ ok: true, deploymentId: req.params.id });
+});
+
+router.get('/config', (_req, res) => {
+  res.json({
+    baseDomain: config.baseDomain,
+    scheme: config.scheme,
+    concurrency: config.concurrency,
+    proxyContainer: config.proxyContainer,
+    proxyNetwork: config.proxyNetwork,
+    workspaceRoot: config.workspaceRoot,
+    memoryLimit: config.memoryLimit,
+    cpuLimit: config.cpuLimit,
+    healthTimeoutMs: config.healthTimeoutMs,
+  });
+});
+
 router.get('/deployments/:id/logs', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -104,7 +136,7 @@ router.post('/deployments/:id/parse-env', upload.single('file'), (req, res) => {
 
   const keysOnly = req.query.keysOnly === '1' || req.query.keysOnly === 'true';
   const rows = keysOnly ? envKeysOnly(text).map((key) => ({ key, value: '' }))
-                        : parseEnvFile(text);
+    : parseEnvFile(text);
 
   res.json({ rows });
 });

@@ -14,3 +14,13 @@ export function streamLogs(id, onLine) {
   es.onmessage = (e) => onLine(JSON.parse(e.data));
   return () => es.close();
 }
+
+// --- Deployments -----------------------------------------------------------
+
+export const listDeployments = () => api('/deployments');
+export const getDeployment  = (id) => api(`/deployments/${id}`);
+export const deleteDeployment = (id) => api(`/deployments/${id}`, { method: 'DELETE' });
+export const stopDeployment   = (id) => api(`/deployments/${id}/stop`,   { method: 'POST' });
+export const startDeployment  = (id) => api(`/deployments/${id}/start`,  { method: 'POST' });
+export const getLogHistory    = (id) => api(`/deployments/${id}/logs/history`);
+export const getConfig        = ()   => api('/config');

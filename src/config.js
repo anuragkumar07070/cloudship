@@ -4,6 +4,7 @@ import os from 'node:os';
 export const config = {
   port: Number(process.env.PORT || 4000),
   baseDomain: process.env.CLOUDSHIP_BASE_DOMAIN || 'localhost',
+  scheme: process.env.CLOUDSHIP_SCHEME || 'http',
   workspaceRoot: process.env.CLOUDSHIP_WORKSPACE || path.join(os.tmpdir(), 'cloudship'),
   dbPath: process.env.CLOUDSHIP_DB || path.join(process.cwd(), 'data', 'cloudship.db'),
   proxyDir: process.env.CLOUDSHIP_PROXY_DIR || path.join(process.cwd(), 'data', 'proxy'),
