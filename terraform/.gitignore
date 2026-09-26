@@ -1,0 +1,11 @@
+# Real variable values - contains your IP, never commit this
+terraform.tfvars
+
+# Terraform state - contains resource details, keep local/private
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# SSH keys, if you ever generate one inside this folder
+*.pem
